@@ -10,7 +10,7 @@ Each problem lists:
 
 "Public" means openddil-tactical-agents, through a pull request. "Overlay" means your private overlay (`tools/init-overlay.sh`).
 
-**Where to branch from.** openddil-tactical-agents branch `algorithms-ports`, open as a draft pull request: the runtime, the replay harness and the ported units are there, not yet on `master`. Problem 1 starts from branch `rul-scoring`, which sits on top of it. Rebase onto `master` once they merge.
+**Where to branch from.** openddil-tactical-agents branch `algorithms-ports`, open as a draft pull request: the runtime, the replay harness and the ported units are there, not yet on `master`. Problem 1 starts from branch `rul-scoring`, which sits on top of it. Once they merge, merge `master` into your branch. Never rebase a branch you've pushed: someone may already have built on it, and a rebase rewrites what they built on.
 
 **Start with problem 1, the scoring metrics.** It needs nothing that isn't already here. Problem 2 needs a kind to be accepted. Problem 3 needs data that is being recorded now.
 
