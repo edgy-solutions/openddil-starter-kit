@@ -23,7 +23,7 @@ You are a contributor to openddil-tactical-agents from your first day: your work
 | `template/speed_watch/` | A small working unit: its `unit.yaml` and its Python. Copy this to start. |
 | `template/tests/` | That unit's tests. They run with no network. |
 | `FIRST-PROBLEMS.md` | Three real gaps to start on, each with its inputs, its acceptance test and the files it touches. |
-| `tools/` | `init-overlay.sh` and its template (a private overlay skeleton), and the git hooks. See "Where your work goes". |
+| `tools/` | `init-overlay.sh` and its template (a private overlay skeleton), and the git hooks. See "Where your work goes". Also `scan-recording.sh`, the scan a recording passes before it's published ("Cutting a recording"). |
 
 ## Get the recording
 
@@ -37,6 +37,38 @@ sha256sum -c SHA256SUMS
 ```
 
 Every line of the check should end `OK`. If one doesn't, download again before you trust anything the replay says. The tarballs can be deleted afterwards. A later recording comes as a new release, with its own sums.
+
+## Cutting a recording
+
+A recording is cut from a test system's broker by whoever maintains this kit. It's published as a release named for the system revision it was recorded at, such as `recording-rev30`, with one tarball per edge and a new `SHA256SUMS`. Before a cut is published, `tools/scan-recording.sh` runs over its tarballs (Git Bash on Windows, with the kit's venv):
+
+```
+PYTHON=.venv/bin/python bash tools/scan-recording.sh --terms <terms-file> --patterns <patterns-file> data-edge-01.tar data-edge-02.tar
+```
+
+On Windows, `PYTHON=.venv/Scripts/python`.
+
+It decodes every record and counts:
+- private terms (`--terms`: one fixed string per line, case-insensitive, the same format as `.git/info/private-terms`);
+- private patterns (`--patterns`: one extended regular expression per line, case-insensitive);
+- email addresses;
+- person names in subject fields;
+- callsigns, which the cut clears.
+
+It reports kinds and counts only, and never prints a value. Both options can be given more than once.
+
+Each hit is placed in one of two classes:
+- **in a field**: the match lies inside one decoded value or key. That fails the scan.
+- **raw only**: the match appears only in the record's bytes read as text, such as three printable bytes of a number. It's listed with its match length for a person to judge.
+
+The exit status:
+- `0`: clean;
+- `1`: failed, or the recording didn't decode;
+- `2`: raw-only hits to judge.
+
+A cut is published only on `0`, or on `2` with every raw-only hit judged and the judgement written in the release notes.
+
+The terms and patterns lists are private and are never committed here. You can run the same scan over a recording you cut yourself, with your own program's terms.
 
 ## Run it
 
