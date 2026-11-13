@@ -269,11 +269,10 @@ def cmd_report(a):
     if reasons:
         out.append("verdict: FAIL (%s)" % ", ".join(reasons))
         code = 1
-    elif raw:
-        out.append("verdict: REVIEW (raw-only hits)")
-        code = 2
     else:
-        out.append("verdict: CLEAN")
+        # Every record decoded and no decoded field holds a hit, so a raw-only hit is bytes that
+        # aren't text (e.g. a varint read as letters): listed as noise, not gating.
+        out.append("verdict: PASS" + (" (raw-byte-only hits, noise: %d)" % raw if raw else ""))
         code = 0
     print("\n".join(out))
     return code

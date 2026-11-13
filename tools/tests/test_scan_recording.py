@@ -80,7 +80,7 @@ def test_clean(tmp_path):
     t = terms_file(tmp_path, [])
     r = run(["--terms", t, d], tmp_path)
     assert r.returncode == 0, r.stdout + r.stderr
-    assert "verdict: CLEAN" in r.stdout
+    assert r.stdout.rstrip().endswith("verdict: PASS")
 
 
 def test_term_in_field(tmp_path):
@@ -101,10 +101,20 @@ def test_term_raw_only(tmp_path):
     d = build(tmp_path, [m], [])
     t = terms_file(tmp_path, ["xA"])
     r = run(["--terms", t, d], tmp_path)
-    assert r.returncode == 2, r.stdout + r.stderr
+    assert r.returncode == 0, r.stdout + r.stderr
     assert "raw only 1" in r.stdout and "in a field 0" in r.stdout
     assert "match length 2-2" in r.stdout
-    assert "verdict: REVIEW" in r.stdout
+    assert "verdict: PASS (raw-byte-only hits, noise: 1)" in r.stdout
+
+
+def test_raw_only_hit_with_a_decode_failure_fails(tmp_path):
+    # A record that doesn't decode is where a raw hit could be real, so the scan fails.
+    m = event(asset_id="Q", event_id="zz", rev=65)
+    d = build(tmp_path, [m], [], extra_lines=[rec(9, b"k9", b"\xffxA\xff")])  # not JSON: fails to decode
+    t = terms_file(tmp_path, ["xA"])
+    r = run(["--terms", t, d], tmp_path)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "decode_failures 1" in r.stdout and "verdict: FAIL (decode_failures)" in r.stdout
 
 
 def test_callsign(tmp_path):

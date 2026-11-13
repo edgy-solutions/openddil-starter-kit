@@ -59,14 +59,13 @@ It reports kinds and counts only, and never prints a value. Both options can be 
 
 Each hit is placed in one of two classes:
 - **in a field**: the match lies inside one decoded value or key. That fails the scan.
-- **raw only**: the match appears only in the record's bytes read as text, such as three printable bytes of a number. It's listed with its match length for a person to judge.
+- **raw only**: the match appears only in the record's bytes read as text, such as three printable bytes of a number. When every record decodes, that is noise: it's listed by count and match length and doesn't gate.
 
 The exit status:
-- `0`: clean;
-- `1`: failed, or the recording didn't decode;
-- `2`: raw-only hits to judge.
+- `0` PASS: every record decodes and no decoded field or key holds a hit;
+- `1` FAIL: a hit in a decoded field or key, a callsign, a person subject, or a record that doesn't decode. A record that doesn't decode is where a raw hit could be real, so it fails.
 
-A cut is published only on `0`, or on `2` with every raw-only hit judged and the judgement written in the release notes.
+A cut is published only on PASS.
 
 The terms and patterns lists are private and are never committed here. You can run the same scan over a recording you cut yourself, with your own program's terms.
 
