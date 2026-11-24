@@ -405,6 +405,165 @@ def test_bad_targets_are_refused(rig, target):
     assert rig["fake"].requests == []
 
 
+def test_kit_url_can_be_a_plain_local_path(rig):
+    bare = rig["fake"].create("alice", "algos", True)
+    path = rig["kit"].as_posix()                      # a path, not a file:// URI
+    r = _run(rig, "--kit-url", path, "--use-existing", "alice/algos")
+    assert r.returncode == 0, r.stderr
+    co = rig["work"] / "algos"
+    assert _git("remote", "get-url", "upstream", cwd=co) == path
+    assert _git("remote", "get-url", "--push", "upstream", cwd=co) == "DISABLED"
+    assert _heads(bare).startswith("refs/heads/main ")
+
+
+def _free_port() -> int:
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _with_shim_first(env, shim: Path) -> dict:
+    """env with `shim` first on PATH. Git Bash puts its own bin dirs ahead of the inherited PATH
+    at start-up, so a BASH_ENV file puts the shim back in front once the shell is running."""
+    d = shim.resolve().as_posix()
+    if len(d) > 2 and d[1] == ":":
+        d = "/" + d[0].lower() + d[2:]
+    rc = shim / "bash_env.sh"
+    rc.write_bytes(f"PATH='{d}':\"$PATH\"\n".encode())
+    out = dict(env)
+    out["PATH"] = str(shim) + os.pathsep + env["PATH"]
+    out["BASH_ENV"] = rc.as_posix()
+    return out
+
+
+def test_a_closed_port_stops_with_a_clear_message(rig):
+    port = _free_port()
+    cmd = [BASH, str(SCRIPT).replace("\\", "/"), "--api-url", f"http://127.0.0.1:{port}",
+           "--kit-url", rig["kit"].as_uri(), "--no-venv", "alice/algos"]
+    r = subprocess.run(cmd, cwd=rig["work"], env=rig["env"], capture_output=True, text=True, timeout=60)
+    assert r.returncode != 0
+    assert f"can't reach 127.0.0.1:{port} within 20 s (connection refused)" in r.stderr
+    assert "--offline" in r.stderr
+    assert not (rig["work"] / "algos").exists()
+
+
+@pytest.mark.parametrize("rc,cause", [(6, "host not found"), (7, "connection refused"),
+                                       (28, "timed out"), (35, "TLS handshake failed")])
+def test_each_connect_failure_names_its_cause(rig, tmp_path, rc, cause):
+    # A real timeout can't be made fast and reliable everywhere, so a curl that exits with
+    # curl's own code stands in for it.
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    (shim / "curl").write_text(f"#!/bin/sh\nexit {rc}\n", newline="\n")
+    env = _with_shim_first(rig["env"], shim)
+    r = _run(rig, "--connect-timeout", "3", "alice/algos", env=env)
+    assert r.returncode != 0
+    assert f"can't reach 127.0.0.1:{rig['port']} within 3 s ({cause})" in r.stderr
+    assert "HTTP 000" not in r.stderr
+    assert not (rig["work"] / "algos").exists()
+
+
+@pytest.mark.parametrize("value", ["0", "abc", "-5", "1.5", ""])
+def test_a_bad_connect_timeout_is_a_usage_error(rig, value):
+    r = _run(rig, "--connect-timeout", value, "alice/algos")
+    assert r.returncode == 2 and "--connect-timeout" in r.stderr
+    assert rig["fake"].requests == []
+    assert not (rig["work"] / "algos").exists()
+
+
+def _offline(rig, *args, env=None, venv=False):
+    cmd = [BASH, str(SCRIPT).replace("\\", "/"), "--offline", "--kit-url", rig["kit"].as_posix(), *args]
+    if not venv:
+        cmd.insert(2, "--no-venv")
+    return subprocess.run(cmd, cwd=rig["work"], env=env or _no_token_env(rig), capture_output=True,
+                          text=True, timeout=180)
+
+
+def _no_token_env(rig):
+    return {k: v for k, v in rig["env"].items() if k not in ("GITHUB_TOKEN", "GH_TOKEN")}
+
+
+def _downloads(rig):
+    src = rig["work"] / "downloads"
+    src.mkdir()
+    for n, b in rig["tars"].items():
+        (src / n).write_bytes(b)
+    return str(src).replace("\\", "/")
+
+
+def test_offline_builds_the_local_checkout_only(rig):
+    r = _offline(rig, "--recording-from", _downloads(rig), "alice/algos")
+    assert r.returncode == 0, r.stderr
+    co = rig["work"] / "algos"
+    for path, data in INNER.items():
+        assert (co / path).read_bytes() == data
+    assert _git("remote", cwd=co) == "upstream"
+    assert _git("remote", "get-url", "upstream", cwd=co) == rig["kit"].as_posix()
+    assert _git("remote", "get-url", "--push", "upstream", cwd=co) == "DISABLED"
+    allowed = (co / ".git" / "info" / "allowed-remotes").read_text().splitlines()
+    assert [ln for ln in allowed if ln.strip() and not ln.startswith("#")] == []
+    assert (co / ".git" / "hooks" / "pre-push").exists()
+    for step in ("1/6", "2/6", "4/6"):
+        assert f"== {step}" in r.stdout
+    assert r.stdout.count("skipped (--offline)") == 3
+    assert "Private repo: none (--offline)" in r.stdout
+    assert "tools/new-algo-repo.sh --use-existing alice/algos" in r.stdout
+    assert "git remote add origin" not in r.stdout
+    assert rig["fake"].requests == []
+
+    other = rig["work"] / "other.git"
+    _git("init", "-q", "--bare", str(other))
+    _git("remote", "add", "elsewhere", other.as_uri(), cwd=co)
+    p = subprocess.run(["git", "push", "elsewhere", "main"], cwd=co, env=rig["env"],
+                       capture_output=True, text=True)
+    assert p.returncode != 0 and "remote-not-allowed" in p.stderr
+    assert _heads(other) == ""
+
+
+def test_offline_makes_no_curl_call_at_all(rig, tmp_path):
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    marker = tmp_path / "curl-was-run"
+    (shim / "curl").write_text(f"#!/bin/sh\necho run > '{marker.as_posix()}'\nexit 1\n", newline="\n")
+    env = _with_shim_first(_no_token_env(rig), shim)
+    subprocess.run([BASH, "-c", "curl"], env=env, capture_output=True)
+    assert marker.exists()                       # the shim really is the curl the script would find
+    marker.unlink()
+    r = _offline(rig, "--recording-from", _downloads(rig), "alice/algos", env=env)
+    assert r.returncode == 0, r.stderr
+    assert not marker.exists()
+    assert rig["fake"].requests == []
+
+
+def test_offline_makes_the_venv_but_installs_nothing(rig):
+    r = _offline(rig, "--no-recording", "alice/algos", venv=True)
+    assert r.returncode == 0, r.stderr
+    assert (rig["work"] / "algos" / ".venv").is_dir()
+    assert "-m pip install --no-index --find-links WHEELS -r requirements.txt" in r.stdout
+    assert "-m pytest -q template/tests" in r.stdout
+
+
+@pytest.mark.parametrize("args,reason", [
+    (["--use-existing", "--recording-from", "."], "nothing for --use-existing to use"),
+    (["--no-recording", "--kit-url", "default"], "needs --kit-url"),
+    (["--no-recording", "--kit-url", "/no/such/dir/example-kit"], "existing local directory"),
+    ([], "--recording-from DIR"),
+])
+def test_offline_refused_combinations(rig, args, reason):
+    args = list(args)
+    cmd = [BASH, str(SCRIPT).replace("\\", "/"), "--offline"]
+    if "default" in args:
+        args.remove("default"); args.remove("--kit-url")      # leave the public default in place
+    elif "--kit-url" not in args:
+        cmd += ["--kit-url", rig["kit"].as_posix()]
+    r = subprocess.run(cmd + args + ["alice/algos"], cwd=rig["work"], env=_no_token_env(rig),
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 1 and reason in r.stderr
+    assert not (rig["work"] / "algos").exists()
+    assert rig["fake"].requests == []
+
+
 @pytest.mark.skipif(os.environ.get("NEW_ALGO_REPO_LIVE") != "1",
                     reason="set NEW_ALGO_REPO_LIVE=1 to clone the real kit and download the real recording (~210 MB)")
 def test_live_kit_and_recording(rig):

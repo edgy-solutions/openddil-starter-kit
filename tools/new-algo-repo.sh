@@ -27,11 +27,20 @@
 #                        downloading them (for machines without internet).
 #   --no-recording       skip the recording.
 #   --no-venv            skip the Python environment and the test run.
-#   --kit-url URL        where to clone the kit from. Default the public kit on
-#                        github.com; use this for a mirror.
+#   --kit-url URL|PATH   where to clone the kit from: a URL, or the path of a
+#                        local clone or mirror. Default the public kit on github.com.
 #   --kit-repo O/N       the repo whose release holds the recording.
 #                        Default edgy-solutions/openddil-starter-kit.
 #   --kit-api URL        that repo's API base. Default https://api.github.com.
+#   --connect-timeout SECS
+#                        how long to wait for a connection to a host before
+#                        stopping with a message that names it. A positive whole
+#                        number. Default 20.
+#   --offline            build the local checkout only: no network, no token, no
+#                        GitHub repo, no origin remote, no push. Needs --kit-url
+#                        (a local clone or mirror) and --recording-from DIR or
+#                        --no-recording; not with --use-existing. Every push is
+#                        refused until you list a remote in .git/info/allowed-remotes.
 #
 # The token:
 #   GITHUB_TOKEN, else GH_TOKEN, else the one git's credential helper holds
@@ -57,10 +66,12 @@
 #   - data/ fetched and checked against SHA256SUMS. data/ is in .gitignore and
 #     never committed.
 #   - .venv with requirements.txt installed, and the template's tests run once.
+#   With --offline, none of the GitHub parts: no origin, no push, and no pip.
 
 set -Eeuo pipefail
 
-KIT_URL="https://github.com/edgy-solutions/openddil-starter-kit.git"
+DEFAULT_KIT_URL="https://github.com/edgy-solutions/openddil-starter-kit.git"
+KIT_URL=$DEFAULT_KIT_URL
 KIT_REPO="edgy-solutions/openddil-starter-kit"
 KIT_API="https://api.github.com"
 UA="openddil-new-algo-repo"
@@ -70,6 +81,8 @@ api=
 dir=
 description="Algorithm work, started from the OpenDDIL starter kit"
 use_existing=0
+connect_timeout=20
+offline=0
 recording=recording-rev30
 recording_from=
 want_recording=1
@@ -97,6 +110,8 @@ while [ $# -gt 0 ]; do
     --kit-url) need_arg $#; KIT_URL=$2; shift 2 ;;
     --kit-repo) need_arg $#; KIT_REPO=$2; shift 2 ;;
     --kit-api) need_arg $#; KIT_API=$2; shift 2 ;;
+    --connect-timeout) need_arg $#; connect_timeout=$2; shift 2 ;;
+    --offline) offline=1; shift ;;
     -h|--help) usage ;;
     -*) echo "new-algo-repo: unknown option: $1" >&2; usage ;;
     *) [ -z "$target" ] || usage; target=$1; shift ;;
@@ -104,6 +119,24 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$target" ] || usage
+printf '%s' "$connect_timeout" | grep -Eq '^[1-9][0-9]*$' \
+  || { echo "new-algo-repo: --connect-timeout wants a positive whole number of seconds, got '$connect_timeout'" >&2; usage; }
+
+# The local directory a --kit-url names (a path or a file:// URI), or nothing.
+local_kit_dir() {
+  local p=$1
+  case "$p" in file://*) p=${p#file://} ;; esac
+  case "$p" in /[A-Za-z]:/*) p=${p#/} ;; esac
+  if [ -d "$p" ]; then printf '%s' "$p"; fi
+  return 0
+}
+if [ "$offline" = 1 ]; then
+  [ "$use_existing" = 0 ] || die "--offline makes no repository, so there is nothing for --use-existing to use"
+  [ "$KIT_URL" != "$DEFAULT_KIT_URL" ] || die "--offline needs --kit-url, the path of a local clone or mirror of the kit"
+  [ -n "$(local_kit_dir "$KIT_URL")" ] || die "--offline needs --kit-url to be an existing local directory (a path or a file:// URI), got '$KIT_URL'"
+  { [ -n "$recording_from" ] || [ "$want_recording" = 0 ]; } \
+    || die "--offline needs --recording-from DIR (the recording's .tar files) or --no-recording"
+fi
 case "$target" in
   */*/*|/*|*/) die "OWNER/NAME expected, got '$target'" ;;
   */*) ;;
@@ -121,7 +154,9 @@ fi
 KIT_API=${KIT_API%/}
 
 # ---- tools -----------------------------------------------------------------
-for tool in git curl tar; do
+needed="git curl tar"
+[ "$offline" = 0 ] || needed="git tar"
+for tool in $needed; do
   command -v "$tool" >/dev/null 2>&1 || die "missing tool: $tool"
 done
 if command -v sha256sum >/dev/null 2>&1; then SUMCHECK=(sha256sum -c --quiet)
@@ -174,28 +209,60 @@ print("" if v is None else (str(v).lower() if isinstance(v, bool) else v))
 PY
 }
 
-# ---- the token ---------------------------------------------------------------
-step="find a token for $host"
-token=${GITHUB_TOKEN:-${GH_TOKEN:-}}
-token_from=env
-if [ -z "$token" ]; then
-  token_from=helper
-  token=$(printf 'protocol=https\nhost=%s\n\n' "$host" | git credential fill 2>/dev/null \
-            | sed -n 's/^password=//p' | head -n 1) || true
-fi
-[ -n "$token" ] || die "no token for $host: set GITHUB_TOKEN, or sign git in to $host (any git clone or push of a private repo there does it)"
+# ---- reaching a host -----------------------------------------------------------
+# curl's exits for "couldn't connect": 6 host not found, 7 refused, 28 timed out, 35 TLS.
+is_connect_rc() { case "$1" in 6|7|28|35) return 0 ;; esac; return 1; }
+# connect_fail RC URL: stop at once with one line naming the host, the timeout and the cause.
+connect_fail() {
+  local rc=$1 url=$2 hp cause
+  hp=${url#*://}; hp=${hp%%/*}; hp=${hp##*@}
+  case "$rc" in
+    6) cause="host not found" ;;
+    7) cause="connection refused" ;;
+    28) cause="timed out" ;;
+    *) cause="TLS handshake failed" ;;
+  esac
+  die "can't reach $hp within $connect_timeout s ($cause). Check the host name, your network or proxy (HTTPS_PROXY), or use --offline."
+}
+# probe URL: git has no connect timeout for http, so reach the host with curl first.
+# Any HTTP status counts as reachable; only a failure to connect stops.
+probe() {
+  local rc=0
+  curl -sS -I -o "$(native "$WORK/probe.out")" --connect-timeout "$connect_timeout" -A "$UA" "$1" 2>/dev/null || rc=$?
+  if is_connect_rc "$rc"; then connect_fail "$rc" "$1"; fi
+  return 0
+}
 
-AUTH="$WORK/auth.hdr"
-( umask 077; printf 'Authorization: Bearer %s\n' "$token" > "$AUTH" )
+# ---- the token ---------------------------------------------------------------
+token=
+token_from=env
+if [ "$offline" = 0 ]; then
+  step="find a token for $host"
+  token=${GITHUB_TOKEN:-${GH_TOKEN:-}}
+  if [ -z "$token" ]; then
+    token_from=helper
+    token=$(printf 'protocol=https\nhost=%s\n\n' "$host" | git credential fill 2>/dev/null \
+              | sed -n 's/^password=//p' | head -n 1) || true
+  fi
+  [ -n "$token" ] || die "no token for $host: set GITHUB_TOKEN, or sign git in to $host (any git clone or push of a private repo there does it)"
+
+  AUTH="$WORK/auth.hdr"
+  ( umask 077; printf 'Authorization: Bearer %s\n' "$token" > "$AUTH" )
+fi
 
 # api METHOD URL [JSON-BODY] [AUTH]: writes the body to $WORK/resp.json, prints the status.
 api_call() {
   local method=$1 url=$2 body=${3-} auth=${4-yes} code
-  local args=(-sS -o "$(native "$WORK/resp.json")" -w '%{http_code}' -X "$method"
+  local args=(-sS --connect-timeout "$connect_timeout" -o "$(native "$WORK/resp.json")" -w '%{http_code}' -X "$method"
               -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' -A "$UA")
   [ "$auth" = yes ] && args+=(-H "@$(native "$AUTH")")
   [ -n "$body" ] && args+=(-H 'Content-Type: application/json' --data-binary "$body")
-  code=$(curl "${args[@]}" "$url") || code=000
+  # curl's exit can't pass out of $( ), so a failure to connect stops the script from in
+  # here: the subshell exits non-zero and the caller's assignment trips set -e.
+  local rc=0
+  code=$(curl "${args[@]}" "$url" 2>"$WORK/curl.err") || rc=$?
+  if is_connect_rc "$rc"; then connect_fail "$rc" "$url"; fi
+  if [ "$rc" != 0 ]; then cat "$WORK/curl.err" >&2; code=000; fi
   printf '%s' "$code"
 }
 api_message() { json "$WORK/resp.json" message; }
@@ -220,6 +287,12 @@ git_auth() {
 }
 
 # ---- 1. the private repo ------------------------------------------------------
+clone_url=
+html_url=
+if [ "$offline" = 1 ]; then
+  echo "== 1/6 sign-in skipped (--offline)"
+  echo "== 2/6 private repo skipped (--offline)"
+else
 step="check the token against $api"
 code=$(api_call GET "$api/user")
 [ "$code" = 200 ] || die "the token was refused by $api (HTTP $code: $(api_message)); check its scopes and its host"
@@ -266,32 +339,42 @@ if [ "$use_existing" = 1 ]; then
   heads=$(git_auth ls-remote --heads "$clone_url") || die "can't list $target's branches with this token"
   [ -z "$heads" ] || die "$target already has branches; --use-existing only seeds an empty repo"
 fi
+fi
 
 # ---- 2. the kit ---------------------------------------------------------------
 step="clone the kit from $KIT_URL"
 echo "== 3/6 clone the kit into $dir"
+case "$KIT_URL" in http://*|https://*) probe "$KIT_URL" ;; esac
+if [ "$offline" = 1 ]; then clone_hint="fix the cause and re-run"
+else clone_hint="$target exists and is empty: fix the cause, then re-run with --use-existing"; fi
 git clone -q --origin upstream "$KIT_URL" "$dir" \
-  || die "the kit couldn't be cloned from $KIT_URL. $target exists and is empty: fix the cause, then re-run with --use-existing"
+  || die "the kit couldn't be cloned from $KIT_URL. $clone_hint"
 cd "$dir"
-# The public kit is fetch-only: your work must never be pushed to it.
+# The kit is fetch-only: your work must never be pushed to it.
 git remote set-url --push upstream DISABLED
-git remote add origin "$clone_url"
+if [ "$offline" = 0 ]; then git remote add origin "$clone_url"; fi
 
 step="install the kit's hooks in private mode"
 if [ -f tools/hooks/install-hooks.sh ] && sh tools/hooks/install-hooks.sh --mode private . >/dev/null; then
   allowed=$(git rev-parse --git-path info/allowed-remotes)
-  printf '%s\n' "$clone_url" >> "$allowed"
+  # Offline there is no origin: the list stays empty, so every push is refused.
+  if [ "$offline" = 0 ]; then printf '%s\n' "$clone_url" >> "$allowed"; fi
   hooks=installed
 else
   echo "new-algo-repo: warning: the hooks weren't installed (is core.hooksPath set?); only the DISABLED push URL guards the public kit" >&2
   hooks=absent
 fi
 
-step="push main to $target"
-branch=$(git symbolic-ref --short HEAD)
-git_auth push -q -u origin "$branch:main" \
-  || die "the push to $target failed; it is still empty. Remove $dir, fix the cause, then re-run with --use-existing"
-echo "== 4/6 pushed $branch to $target (main)"
+if [ "$offline" = 1 ]; then
+  echo "== 4/6 push skipped (--offline)"
+else
+  step="push main to $target"
+  case "$clone_url" in http://*|https://*) probe "$clone_url" ;; esac
+  branch=$(git symbolic-ref --short HEAD)
+  git_auth push -q -u origin "$branch:main" \
+    || die "the push to $target failed; it is still empty. Remove $dir, fix the cause, then re-run with --use-existing"
+  echo "== 4/6 pushed $branch to $target (main)"
+fi
 
 # ---- 3. the recording ---------------------------------------------------------
 fetch_recording() {
@@ -324,9 +407,12 @@ PY
       echo "   downloading $aname"
       local dest=$aname
       if [ "$aname" = SHA256SUMS ]; then dest="$WORK/SHA256SUMS"; sums="$WORK/SHA256SUMS"; fi
-      local cargs=(-fsSL --retry 3 -A "$UA" -o "$(native "$dest")")
+      local cargs=(-fsSL --connect-timeout "$connect_timeout" --retry 3 -A "$UA" -o "$(native "$dest")")
       [ "$kit_auth" = yes ] && cargs+=(-H "@$(native "$AUTH")")
-      curl "${cargs[@]}" "$aurl" || die "download of $aname failed"
+      local crc=0
+      curl "${cargs[@]}" "$aurl" 2>"$WORK/curl.err" || crc=$?
+      if is_connect_rc "$crc"; then connect_fail "$crc" "$aurl"; fi
+      if [ "$crc" != 0 ]; then cat "$WORK/curl.err" >&2; die "download of $aname failed"; fi
     done < "$WORK/assets.tsv"
   fi
   for t in ./*.tar; do
@@ -359,27 +445,45 @@ if [ "$want_venv" = 1 ]; then
   echo "== 6/6 python environment and the template's tests"
   "${PY[@]}" -m venv .venv
   if [ -x .venv/Scripts/python.exe ]; then VPY=.venv/Scripts/python.exe; else VPY=.venv/bin/python; fi
-  "$VPY" -m pip install -q --disable-pip-version-check -r requirements.txt
-  step="run the template's tests"
-  "$VPY" -m pytest -q template/tests
+  if [ "$offline" = 1 ]; then
+    echo "   .venv is made, but pip needs an index: nothing is installed and no tests ran (--offline)."
+    echo "   From a folder of wheels (WHEELS):"
+    echo "     $VPY -m pip install --no-index --find-links WHEELS -r requirements.txt"
+    echo "     $VPY -m pytest -q template/tests"
+  else
+    "$VPY" -m pip install -q --disable-pip-version-check -r requirements.txt
+    step="run the template's tests"
+    "$VPY" -m pytest -q template/tests
+  fi
 else
   echo "== 6/6 python environment skipped (--no-venv)"
 fi
 
 step=""
+if [ "$offline" = 1 ]; then
+  repo_line="none (--offline)"
+  hooks_line="$hooks (private mode; no remote is allowed yet, so every push is refused)"
+  next3="Publish later: on a machine that can reach your GitHub host, have an empty private repo
+     made and run tools/new-algo-repo.sh --use-existing $target; it clones fresh and
+     checks the repo reads private before it pushes."
+else
+  repo_line=${html_url:-$target}
+  hooks_line="$hooks (private mode; only origin may be pushed to)"
+  next3="Work on branches and open pull requests in $target."
+fi
 cat <<EOF
 
-Done. Private repo: ${html_url:-$target}
+Done. Private repo: $repo_line
 Local checkout:     $(pwd)
-Hooks:              $hooks (private mode; only origin may be pushed to)
+Hooks:              $hooks_line
 
 Next:
   1. Read README.md ("Day one"), DATA.md and FIRST-PROBLEMS.md.
   2. Copy template/speed_watch to start a unit, and replay it:
        .venv/bin/python run_replay.py template/speed_watch data/edge-01 out/speed_watch-edge-01.json
      (Windows: .venv/Scripts/python.exe)
-  3. Work on branches and open pull requests in $target.
+  3. $next3
 
-To take later updates from the public kit (merge, never rebase a pushed branch):
+To take later updates from the kit (merge, never rebase a pushed branch):
   git fetch upstream && git merge upstream/main
 EOF

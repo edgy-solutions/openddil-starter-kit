@@ -102,6 +102,20 @@ It does six things, in order, and stops at the first that fails:
 
 **GitHub Enterprise Server.** Pass `--host github.example.com`. The API defaults to `https://github.example.com/api/v3`, and `--api-url` overrides it. If the kit is mirrored on your server, point `--kit-url`, `--kit-repo` and `--kit-api` at the mirror. On a machine without internet access, `--recording-from DIR` takes tarballs you have already downloaded. `--help` lists every option.
 
+**A local kit.** `--kit-url` takes a path as well as a URL: the path of a local clone or mirror of this kit. Use it when the machine reaches only an internal GitHub host, an admin has made the empty private repository, and the kit was copied in as a local clone:
+
+```
+GITHUB_TOKEN=<token> bash tools/new-algo-repo.sh --host github.example.com \
+  --kit-url /path/to/openddil-starter-kit --use-existing \
+  --recording-from /path/to/recording example-org/example-algorithms
+```
+
+`upstream` then points at that path, so `git fetch upstream` takes updates from wherever that clone is refreshed. Its push URL is still `DISABLED`.
+
+**Unreachable hosts.** Every connection waits at most `--connect-timeout SECS` (default 20). If a host can't be reached, the script stops at once with one line naming the host, the timeout and the cause (host not found, connection refused, timed out, or TLS handshake failed). Check the host name, your network or proxy (`HTTPS_PROXY`), or use `--offline`.
+
+**No network at all.** `--offline` builds only the local checkout: no token, no connection of any kind, no GitHub repository, no `origin`, no push. It needs `--kit-url` pointing at a local clone or mirror, and `--recording-from DIR` or `--no-recording`; it can't be combined with `--use-existing`. Steps 1, 2 and 4 are skipped. The hooks are installed in private mode with no remote allowed, so every push is refused until you list one in `.git/info/allowed-remotes`. `.venv` is made but nothing is installed: the script prints how to install from a folder of wheels (`pip install --no-index --find-links WHEELS -r requirements.txt`) and run the tests. To publish later, on a machine that can reach your GitHub host, have an empty private repository made and run `tools/new-algo-repo.sh --use-existing OWNER/NAME`; it clones fresh and checks the repository reads private before it pushes.
+
 To take later changes to the kit: `git fetch upstream && git merge upstream/main`.
 
 A private copy is for your own work. A unit meant for the real runner still goes to openddil-tactical-agents as a pull request ("Where your work goes"), and anything else from your program goes in an overlay.
