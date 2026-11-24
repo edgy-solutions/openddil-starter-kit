@@ -23,7 +23,7 @@ You are a contributor to openddil-tactical-agents from your first day: your work
 | `template/speed_watch/` | A small working unit: its `unit.yaml` and its Python. Copy this to start. |
 | `template/tests/` | That unit's tests. They run with no network. |
 | `FIRST-PROBLEMS.md` | Three real gaps to start on, each with its inputs, its acceptance test and the files it touches. |
-| `tools/` | `init-overlay.sh` and its template (a private overlay skeleton), and the git hooks. See "Where your work goes". Also `scan-recording.sh`, the scan a recording passes before it's published ("Cutting a recording"). |
+| `tools/` | `new-algo-repo.sh`, which makes your own private copy of this kit ("Your own private copy"). `init-overlay.sh` and its template (a private overlay skeleton), and the git hooks. See "Where your work goes". Also `scan-recording.sh`, the scan a recording passes before it's published ("Cutting a recording"). |
 
 ## Get the recording
 
@@ -35,6 +35,8 @@ tar -xf data-edge-01.tar
 tar -xf data-edge-02.tar
 sha256sum -c SHA256SUMS
 ```
+
+Without `gh`, download the two tarballs from the release page instead, or let `tools/new-algo-repo.sh` fetch and check them ("Your own private copy").
 
 Every line of the check should end `OK`. If one doesn't, download again before you trust anything the replay says. The tarballs can be deleted afterwards. A later recording comes as a new release, with its own sums.
 
@@ -79,6 +81,44 @@ python -m venv .venv
 ```
 
 The last line replays the unit over one edge's recorded input and writes a JSON report: records read, what the unit emitted, and any step that failed.
+
+## Your own private copy
+
+`tools/new-algo-repo.sh` makes a private GitHub repository from this kit, so you can try units against your own program's data where no one else can see them. It doesn't need the GitHub CLI (`gh`). It needs git, curl, tar, Python 3.11+, and sha256sum or shasum. Run it in Git Bash on Windows, or in any bash, from the folder the checkout should go in:
+
+```
+GITHUB_TOKEN=<token> bash tools/new-algo-repo.sh your-org/your-algorithms
+```
+
+It does six things, in order, and stops at the first that fails:
+1. Creates `your-org/your-algorithms` as a private repository, and reads it back. If GitHub reports it as anything but private, the script stops before anything is pushed. If your organization only lets admins create repositories, have one create an empty private repository, then pass `--use-existing`.
+2. Clones this kit into `./your-algorithms`. The kit becomes remote `upstream`, which can be fetched from but not pushed to. Your repository becomes `origin`.
+3. Installs the kit's hooks in private mode, with only your repository's URL allowed. A push anywhere else is refused.
+4. Pushes the kit's history to your repository's `main`.
+5. Downloads the recording, unpacks it into `data/` (which git ignores), and checks every file against `SHA256SUMS`.
+6. Makes `.venv`, installs `requirements.txt`, and runs the template's tests.
+
+**The token.** The script reads `GITHUB_TOKEN`, then `GH_TOKEN`. If neither is set, it asks git's credential helper, which is the sign-in `git push` already uses; on Windows, Git Credential Manager opens a browser sign-in if it has none. The token needs either the `repo` scope (a classic token), or Administration and Contents read and write on the owner (a fine-grained token). It is never printed, and never put on a command line or in `.git/config`.
+
+**GitHub Enterprise Server.** Pass `--host github.example.com`. The API defaults to `https://github.example.com/api/v3`, and `--api-url` overrides it. If the kit is mirrored on your server, point `--kit-url`, `--kit-repo` and `--kit-api` at the mirror. On a machine without internet access, `--recording-from DIR` takes tarballs you have already downloaded. `--help` lists every option.
+
+**A local kit.** `--kit-url` takes a path as well as a URL: the path of a local clone or mirror of this kit. Use it when the machine reaches only an internal GitHub host, an admin has made the empty private repository, and the kit was copied in as a local clone:
+
+```
+GITHUB_TOKEN=<token> bash tools/new-algo-repo.sh --host github.example.com \
+  --kit-url /path/to/openddil-starter-kit --use-existing \
+  --recording-from /path/to/recording example-org/example-algorithms
+```
+
+`upstream` then points at that path, so `git fetch upstream` takes updates from wherever that clone is refreshed. Its push URL is still `DISABLED`.
+
+**Unreachable hosts.** Every connection waits at most `--connect-timeout SECS` (default 20). If a host can't be reached, the script stops at once with one line naming the host, the timeout and the cause (host not found, connection refused, timed out, or TLS handshake failed). Check the host name, your network or proxy (`HTTPS_PROXY`), or use `--offline`.
+
+**No network at all.** `--offline` builds only the local checkout: no token, no connection of any kind, no GitHub repository, no `origin`, no push. It needs `--kit-url` pointing at a local clone or mirror, and `--recording-from DIR` or `--no-recording`; it can't be combined with `--use-existing`. Steps 1, 2 and 4 are skipped. The hooks are installed in private mode with no remote allowed, so every push is refused until you list one in `.git/info/allowed-remotes`. `.venv` is made but nothing is installed: the script prints how to install from a folder of wheels (`pip install --no-index --find-links WHEELS -r requirements.txt`) and run the tests. To publish later, on a machine that can reach your GitHub host, have an empty private repository made and run `tools/new-algo-repo.sh --use-existing OWNER/NAME`; it clones fresh and checks the repository reads private before it pushes.
+
+To take later changes to the kit: `git fetch upstream && git merge upstream/main`.
+
+A private copy is for your own work. A unit meant for the real runner still goes to openddil-tactical-agents as a pull request ("Where your work goes"), and anything else from your program goes in an overlay.
 
 ## Where your work goes
 
